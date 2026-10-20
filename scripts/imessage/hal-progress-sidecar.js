@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// hal-progress-sidecar v8 — TYPING-ONLY, instant via chat.db polling
+// hal-progress-sidecar v10 — typing + embodied status + end-of-turn summary
 // Design: sidecar provides ONLY the native typing indicator (fast, from chat.db poll).
 // Rich status bubbles come from the agent calling hal-progress manually (two-line format).
 // No auto-bubbles — they just clutter. Typing starts the instant an inbound message lands.

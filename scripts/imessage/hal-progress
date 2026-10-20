@@ -1,4 +1,5 @@
 #!/bin/zsh
+# hal-progress v10 — two-line status bubble with emoji-embodied (exec/thinking/found) + auto-capture run
 PHONE="+12269983286"
 CHAT="iMessage;-;+12269983286"
 IMSG="/usr/local/bin/imsg"
@@ -21,6 +22,23 @@ _send_bubble() {
   sqlite3 "$DB" "SELECT guid FROM message WHERE is_from_me=1 AND rowid>$BEFORE ORDER BY rowid DESC LIMIT 1;" 2>/dev/null
 }
 
+_edit() {
+  local GUID="$1" HEADER="$2" STATUS="$3"
+  "$IMSG" edit --chat "$CHAT" --message "$GUID" --new-text "$(printf "%s\n\n%s" "$HEADER" "$STATUS")" --json >/dev/null 2>&1
+}
+
+# Map a label to its emoji-embodied form
+_embody() {
+  case "$1" in
+    exec)     echo "⚙️ exec" ;;
+    thinking) echo "🤔 thinking" ;;
+    found)    echo "🔍 found" ;;
+    done)     echo "✅ done" ;;
+    error|fail) echo "❌ error" ;;
+    *)        echo "$1" ;;
+  esac
+}
+
 case $1 in
   start)
     HEADER="⏳ ${2:-(working)}"
@@ -29,15 +47,54 @@ case $1 in
       printf "%s" "$HEADER" > "$STATE_DIR/$GUID.txt"
       echo "$GUID"
     fi ;;
+
+  # update GUID label "message"  — e.g. update GUID exec "gh auth status"
   update)
-    [[ -z $2 || -z $3 ]] && exit 0
+    [[ -z $2 ]] && exit 0
     HEADER=$(cat "$STATE_DIR/$2.txt" 2>/dev/null)
     [[ -z $HEADER ]] && HEADER="⏳ Working..."
-    "$IMSG" edit --chat "$CHAT" --message "$2" --new-text "$(printf "%s\n\n%s" "$HEADER" "$3")" --json >/dev/null 2>&1 ;;
-  done) rm -f "$STATE_DIR/${2}.txt" 2>/dev/null ;;
+    if [[ -n $4 || $3 == exec || $3 == thinking || $3 == found || $3 == done || $3 == error ]]; then
+      LABEL=$(_embody "$3")
+      _edit "$2" "$HEADER" "($LABEL): $4" 
+    else
+      # backward compat: update GUID "raw status line"
+      _edit "$2" "$HEADER" "$3"
+    fi ;;
+
+  # run GUID "command" — shows (⚙️ exec): cmd, runs it, then (🔍 found): first output line
+  run)
+    GUID="$2"; CMD="$3"
+    HEADER=$(cat "$STATE_DIR/$GUID.txt" 2>/dev/null)
+    [[ -z $HEADER ]] && HEADER="⏳ Working..."
+    _edit "$GUID" "$HEADER" "(⚙️ exec): $CMD"
+    OUT=$(eval "$CMD" 2>&1)
+    EXIT=$?
+    FIRST=$(echo "$OUT" | grep -v '^$' | head -1 | cut -c1-80)
+    if [[ $EXIT -eq 0 ]]; then
+      _edit "$GUID" "$HEADER" "(🔍 found): ${FIRST:-done ✓}"
+    else
+      _edit "$GUID" "$HEADER" "(❌ error): ${FIRST:-exit $EXIT}"
+    fi
+    echo "$OUT" ;;
+
+  # header GUID "new header"  — new sub-task, same bubble
+  header)
+    [[ -z $2 || -z $3 ]] && exit 0
+    NEWH="⏳ $3"
+    printf "%s" "$NEWH" > "$STATE_DIR/$2.txt"
+    _edit "$2" "$NEWH" "" ;;
+
+  done)
+    if [[ -n $3 ]]; then
+      HEADER=$(cat "$STATE_DIR/$2.txt" 2>/dev/null)
+      _edit "$2" "${HEADER:-✅ Done}" "$3"
+    fi
+    rm -f "$STATE_DIR/${2}.txt" 2>/dev/null ;;
+
   check-deleted)
     [[ -z $2 ]] && exit 0
     R=$(sqlite3 "$DB" "SELECT COUNT(*) FROM message WHERE guid='$2' AND date_retracted IS NOT NULL AND date_retracted!=0;" 2>/dev/null)
     [[ $R -gt 0 ]] && echo deleted && exit 1; echo exists ;;
-  *) echo "Usage: hal-progress start|update|done|check-deleted" >&2; exit 1 ;;
+
+  *) echo "Usage: hal-progress start|update|run|header|done|check-deleted" >&2; exit 1 ;;
 esac
