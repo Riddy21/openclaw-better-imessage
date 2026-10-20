@@ -70,13 +70,8 @@ case $1 in
     # start "Header text" [reply_to_guid]
     HEADER="⏳ ${2:-(working)}"
     REPLY_TO="${3:-$(_last_user_guid)}"
-    GUID=""
-    if [[ -f $CUR_FILE ]]; then
-      AGE=$(( $(date +%s) - $(stat -f %m "$CUR_FILE" 2>/dev/null || echo 0) ))
-      [[ $AGE -lt 120 ]] && GUID=$(cat "$CUR_FILE" 2>/dev/null)
-    fi
-    if [[ -n $GUID ]]; then _edit_bubble "$GUID" "$HEADER"
-    else GUID=$(_send_bubble "$HEADER" "$REPLY_TO"); fi
+    # Always send a fresh bubble — sidecar v12 is typing-only, nothing to adopt
+    GUID=$(_send_bubble "$HEADER" "$REPLY_TO")
     if [[ -n $GUID && ${#GUID} -lt 50 && $GUID != *"{{"* ]]; then
       printf "%s" "$HEADER" > "$STATE_DIR/$GUID.txt"
       printf "" > "$STATE_DIR/$GUID.steps"
