@@ -70,9 +70,26 @@ case $1 in
     # start "Header text" [reply_to_guid]
     HEADER="⏳ ${2:-(working)}"
     REPLY_TO="${3:-$(_last_user_guid)}"
-    # Always send a fresh bubble — sidecar v12 is typing-only, nothing to adopt
+    # Adopt hook bubble if recent (<120s), else send fresh
+    if [[ -f $CUR_FILE ]]; then
+      HOOK_GUID=$(cat "$CUR_FILE" 2>/dev/null | tr -d '\n')
+      HOOK_TS=$(cat "$CUR_FILE.ts" 2>/dev/null | tr -d '\n')
+      AGE=$(( $(date +%s) - ${HOOK_TS:-0} ))
+      if [[ -n $HOOK_GUID && ${#HOOK_GUID} -lt 60 && $AGE -lt 120 ]]; then
+        GUID="$HOOK_GUID"
+        printf "%s" "$HEADER" > "$STATE_DIR/$GUID.txt"
+        printf "" > "$STATE_DIR/$GUID.steps"
+        date +%s > "$STATE_DIR/$GUID.start"
+        _git_nums > "$STATE_DIR/$GUID.snap"
+        : > "$MANUAL_FLAG"
+        _edit_bubble "$GUID" "$HEADER"
+        rm -f "$CUR_FILE"
+        echo "$GUID"
+        exit 0
+      fi
+    fi
     GUID=$(_send_bubble "$HEADER" "$REPLY_TO")
-    if [[ -n $GUID && ${#GUID} -lt 50 && $GUID != *"{{"* ]]; then
+    if [[ -n $GUID && ${#GUID} -lt 60 && $GUID != *"{{{"* ]]; then
       printf "%s" "$HEADER" > "$STATE_DIR/$GUID.txt"
       printf "" > "$STATE_DIR/$GUID.steps"
       date +%s > "$STATE_DIR/$GUID.start"
