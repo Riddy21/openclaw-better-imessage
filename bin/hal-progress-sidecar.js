@@ -1,124 +1,164 @@
 #!/usr/bin/env node
-// hal-progress-sidecar v5 - AppleScript-first, bridge optional
-// Root cause of bridge ejection: Messages.app Hardened Process entitlement
-// Solution: never depend on bridge for sends, use bridge only for optional features
+// hal-progress-sidecar v10 — typing + embodied status + end-of-turn summary
+// Design: sidecar provides ONLY the native typing indicator (fast, from chat.db poll).
+// Rich status bubbles come from the agent calling hal-progress manually (two-line format).
+// No auto-bubbles — they just clutter. Typing starts the instant an inbound message lands.
 
-const { spawnSync, execSync } = require('child_process');
+const { spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+const CUR_FILE = "/tmp/hal-progress-current";
+const MANUAL_FLAG = "/tmp/hal-progress-manual";
+function manualActive() { try { return fs.existsSync(MANUAL_FLAG); } catch(_) { return false; } }
+
 const LOG_PATH = path.join(os.homedir(), 'Library/Logs/openclaw/gateway.log');
 const IMSG = '/usr/local/bin/imsg';
 const PHONE = '+12269983286';
-const CHAT = 'iMessage;-;+12269983286';
 const DB = path.join(os.homedir(), 'Library/Messages/chat.db');
-const STATE_FILE = '/tmp/hal-progress-state.json';
-const STATE_DIR = '/tmp/hal-progress-state';
-try { require('fs').mkdirSync(STATE_DIR, { recursive: true }); } catch(_) {}
 const IMSG_SESSION = 'agent:main:imessage:direct:+12269983286';
 
-function loadState() { try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch(_) { return {}; } }
-function saveState(s) { try { fs.writeFileSync(STATE_FILE, JSON.stringify(s)); } catch(_) {} }
-
-// Send as thread reply to last user message — shows in-context
-function getLastUserGuid() {
-  const r = spawnSync('sqlite3', [DB, 'SELECT guid FROM message WHERE is_from_me=0 ORDER BY rowid DESC LIMIT 1;'], { encoding: 'utf8', timeout: 3000 });
+function sql(q) {
+  const r = spawnSync('sqlite3', [DB, q], { encoding: 'utf8', timeout: 3000 });
   return (r.stdout || '').trim();
 }
-
-function sendBubble(text) {
-  try {
-    const r0 = spawnSync('sqlite3', [DB, 'SELECT COALESCE(MAX(rowid),0) FROM message WHERE is_from_me=1;'], { encoding: 'utf8', timeout: 3000 });
-    const beforeRowid = (r0.stdout || '0').trim();
-    // Try send-rich with reply-to first (threads to user's message)
-    const replyGuid = getLastUserGuid();
-    let sentViaRich = false;
-    if (replyGuid) {
-      const richResult = spawnSync(IMSG, ['send-rich', '--chat', CHAT, '--reply-to', replyGuid, '--text', text, '--json'], { encoding: 'utf8', timeout: 8000 });
-      sentViaRich = (richResult.stdout || '').includes('guid') || richResult.status === 0;
-    }
-    if (!sentViaRich) {
-      // Fallback: AppleScript send
-      const script = 'tell application "Messages" to send "' + text.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '" to buddy "' + PHONE + '" of (first service whose service type = iMessage)';
-      spawnSync('osascript', ['-e', script], { timeout: 8000 });
-    }
-    execSync('sleep 1.2');
-    const r2 = spawnSync('sqlite3', [DB, 'SELECT guid FROM message WHERE is_from_me=1 AND rowid > ' + beforeRowid + ' ORDER BY rowid DESC LIMIT 1;'], { encoding: 'utf8', timeout: 3000 });
-    return (r2.stdout || '').trim() || null;
-  } catch(_) { return null; }
-}
-
-// Bridge features — best-effort only (bridge lasts ~90s before macOS ejects it)
-function editBubble(guid, text) {
-  try { spawnSync(IMSG, ["edit", "--chat", CHAT, "--message", guid, "--new-text", text, "--json"], { timeout: 5000 }); } catch(_) {}
-}
-
 function sendTyping() {
-  try { spawnSync(IMSG, ["typing", "--to", PHONE, "--duration", "4s", "--json"], { timeout: 6000 }); } catch(_) {}
+  try { spawnSync(IMSG, ["typing", "--to", PHONE, "--duration", "6s", "--json"], { timeout: 7000 }); } catch(_) {}
 }
 
-// On startup: wipe stale bubbles
-(function cleanOnBoot() {
-  const s = loadState();
-  Object.values(s).forEach(info => {
-    if (info.guid) { try { spawnSync(IMSG, ["unsend", "--chat", CHAT, "--message", info.guid, "--json"], { timeout: 5000 }); } catch(_) {} }
-  });
-  saveState({});
-  console.log("[sidecar v5] boot cleanup done");
-})();
+// ── End-of-turn work summary ("📝 N files +X -Y · S steps · Ts") ──────────────
+const REPOS = ["/Users/hal9000/friday-pro", "/Users/hal9000/.openclaw/workspace"];
+function statNum(s, kw) { for (const p of s.split(",")) { if (p.includes(kw)) return parseInt(p.trim()) || 0; } return 0; }
+function gitStat(repo) {
+  try {
+    let r = spawnSync("git", ["-C", repo, "diff", "--shortstat", "HEAD"], { encoding: "utf8", timeout: 4000 });
+    if (r.status !== 0) r = spawnSync("git", ["-C", repo, "diff", "--shortstat"], { encoding: "utf8", timeout: 4000 });
+    const out = (r.stdout || "").trim();
+    return { files: statNum(out, "file"), ins: statNum(out, "insertion"), del: statNum(out, "deletion") };
+  } catch (_) { return { files: 0, ins: 0, del: 0 }; }
+}
+function snapshotRepos() { const s = {}; for (const r of REPOS) s[r] = gitStat(r); return s; }
+function deltaSummary(startSnap) {
+  let files = 0, ins = 0, del = 0;
+  for (const repo of REPOS) {
+    const b = (startSnap && startSnap[repo]) || { files: 0, ins: 0, del: 0 };
+    const a = gitStat(repo);
+    const fd = a.files - b.files;
+    files += fd > 0 ? fd : (a.files !== b.files ? a.files : 0);
+    ins += Math.max(0, a.ins - b.ins);
+    del += Math.max(0, a.del - b.del);
+  }
+  return { files, ins, del };
+}
+function buildSummary(info) {
+  const secs = Math.max(1, Math.round((Date.now() - (info.startedAt || Date.now())) / 1000));
+  const steps = info.toolCount || 0;
+  const d = deltaSummary(info.startSnap);
+  const parts = [];
+  if (d.files > 0) {
+    let f = "📝 " + d.files + " file" + (d.files === 1 ? "" : "s");
+    if (d.ins > 0) f += " +" + d.ins;
+    if (d.del > 0) f += " -" + d.del;
+    parts.push(f);
+  }
+  if (steps > 0) parts.push(steps + " step" + (steps === 1 ? "" : "s"));
+  parts.push(secs + "s");
+  return "✅ Done · " + parts.join(" · ");
+}
+function getLastUserGuid() { return sql("SELECT guid FROM message WHERE is_from_me=0 ORDER BY rowid DESC LIMIT 1;"); }
+function sendBubble(text) {
+  const rg = getLastUserGuid();
+  if (rg) {
+    const r = spawnSync(IMSG, ["send-rich", "--chat", "iMessage;-;" + PHONE, "--reply-to", rg, "--text", text, "--json"], { timeout: 6000 });
+    if (r.status === 0) return;
+  }
+  try { spawnSync(IMSG, ["send", "--to", PHONE, "--text", text, "--json"], { timeout: 6000 }); } catch(_) {}
+}
+function sendBubbleGuid(text) {
+  const beforeRow = parseInt(sql("SELECT COALESCE(MAX(rowid),0) FROM message WHERE is_from_me=1;")) || 0;
+  const rg = getLastUserGuid();
+  if (rg) {
+    const r = spawnSync(IMSG, ["send-rich", "--chat", "iMessage;-;" + PHONE, "--reply-to", rg, "--text", text, "--json"], { timeout: 6000 });
+    if (r.status === 0) {
+      spawnSync("sleep", ["1.0"]);
+      return sql("SELECT guid FROM message WHERE is_from_me=1 AND rowid>" + beforeRow + " ORDER BY rowid DESC LIMIT 1;") || null;
+    }
+  }
+  return null;
+}
+function editBubble(guid, text) {
+  try { spawnSync(IMSG, ["edit", "--chat", "iMessage;-;" + PHONE, "--message", guid, "--new-text", text, "--json"], { timeout: 5000 }); } catch(_) {}
+}
+// Embodied status per activity. The gateway log only distinguishes model-call
+// (thinking) from tool-exec (running a command), so those are the two we embody.
+function statusFor(line) {
+  if (line.includes("milestone=model_call_started")) return "🧠 Thinking…";
+  if (line.includes("milestone=tool_execution_started")) return "🔧 Running a command…";
+  return null;
+}
+function finishTurn() {
+  if (turnStartSnap === null) return;
+  const info = { startedAt: turnStartedAt, toolCount: turnToolCount, startSnap: turnStartSnap };
+  turnStartSnap = null;
+  try {
+    if (!manualActive()) {           // manual hal-progress owns the bubble → its `done` summarizes
+      const s = buildSummary(info);
+      if (turnBubbleGuid) editBubble(turnBubbleGuid, s);
+      else sendBubble(s);
+      console.log("[sidecar v11] turn done: " + s);
+    } else {
+      console.log("[sidecar v11] turn done (manual bubble owns it)");
+    }
+  } catch(_) {}
+  try { if (fs.existsSync(CUR_FILE)) fs.unlinkSync(CUR_FILE); } catch(_) {}
+  turnBubbleGuid = null;
+  turnLastStatus = "";
+}
 
-const START_TIME = Date.now();
+console.log("[sidecar v10] started — embodied status + end-of-turn summary");
+
+// Instant typing: poll chat.db for new inbound, keep typing alive while turn runs
+let lastSeenRow = parseInt(sql("SELECT COALESCE(MAX(rowid),0) FROM message;")) || 0;
+let typingTimer = null;
+let turnStartedAt = 0;
+let turnStartSnap = null;
+let turnToolCount = 0;
+let turnBubbleGuid = null;
+let turnLastStatus = "";
+
+function startTyping() {
+  if (typingTimer) return;
+  sendTyping();
+  typingTimer = setInterval(sendTyping, 4000);
+  turnStartedAt = Date.now();
+  turnStartSnap = snapshotRepos();
+  turnToolCount = 0;
+  // Clear a stale manual flag (crashed turn) so we don't stay silent forever
+  try { if (fs.existsSync(MANUAL_FLAG) && (Date.now() - fs.statSync(MANUAL_FLAG).mtimeMs > 300000)) fs.unlinkSync(MANUAL_FLAG); } catch(_) {}
+  turnLastStatus = "🧠 Thinking…";
+  turnBubbleGuid = sendBubbleGuid(turnLastStatus);
+  try { if (turnBubbleGuid) fs.writeFileSync(CUR_FILE, turnBubbleGuid); } catch(_) {}
+  console.log("[sidecar v11] turn started, bubble=" + (turnBubbleGuid || "none"));
+}
+function stopTyping() {
+  if (typingTimer) { clearInterval(typingTimer); typingTimer = null; console.log("[sidecar v8] typing stopped"); }
+}
+
+// Poll chat.db every 400ms for new inbound message → instant typing
+setInterval(() => {
+  try {
+    const maxRow = parseInt(sql("SELECT COALESCE(MAX(rowid),0) FROM message;")) || 0;
+    if (maxRow <= lastSeenRow) return;
+    const newInbound = sql("SELECT COUNT(*) FROM message WHERE rowid>" + lastSeenRow + " AND is_from_me=0 AND text IS NOT NULL;");
+    lastSeenRow = maxRow;
+    if (parseInt(newInbound) > 0) startTyping();
+  } catch(_) {}
+}, 400);
+
+// Watch gateway.log for turn end → stop typing
 let lastSize = 0;
 try { lastSize = fs.statSync(LOG_PATH).size; } catch(_) {}
-
-function processLine(line) {
-  if (!line.includes(IMSG_SESSION)) return;
-  const tsMatch = line.match(/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})/);
-  if (tsMatch && new Date(tsMatch[1]).getTime() < START_TIME) return;
-  const runMatch = line.match(/runId=([a-f0-9-]{36})/);
-  if (!runMatch) return;
-  const runId = runMatch[1];
-
-  if (line.includes("milestone=tool_execution_started") || line.includes("milestone=model_call_started")) {
-    const active = loadState();
-    if (!active[runId]) {
-      sendTyping();
-      // Extract context from log line for Telegram-style visibility
-      let bubbleText = "\u23f3 Working...";
-      if (line.includes('tool_execution_started')) {
-        const stages = line.match(/stages=([^\s]+)/);
-        if (stages && stages[1].includes('imessage')) bubbleText = "\u23f3 Processing your message...";
-        else bubbleText = "\u23f3 Running tools...";
-      } else if (line.includes('model_call_started')) {
-        bubbleText = "\u23f3 Thinking...";
-      }
-      const guid = sendBubble(bubbleText);
-      if (guid) {
-        const typingTimer = setInterval(() => {
-          const s = loadState();
-          if (s[runId]) { sendTyping(); } else { clearInterval(typingTimer); }
-        }, 2000);
-        active[runId] = { guid, startedAt: Date.now(), source: "sidecar" };
-        saveState(active);
-        console.log(`[sidecar v5] sent bubble run=${runId.slice(0,8)} guid=${guid.slice(0,8)}`);
-      }
-    } else {
-      sendTyping();
-    }
-    return;
-  }
-
-  if (line.includes("[imessage] embedded run agent end")) {
-    const active = loadState();
-    if (active[runId]) {
-      console.log(`[sidecar v5] turn done run=${runId.slice(0,8)} — keeping bubble per user preference`);
-      delete active[runId];
-      saveState(active);
-    }
-  }
-}
-
 setInterval(() => {
   try {
     const stat = fs.statSync(LOG_PATH);
@@ -128,8 +168,24 @@ setInterval(() => {
     fs.readSync(fd, buf, 0, buf.length, lastSize);
     fs.closeSync(fd);
     lastSize = stat.size;
-    buf.toString("utf8").split("\n").filter(Boolean).forEach(processLine);
+    buf.toString("utf8").split("\n").filter(Boolean).forEach(line => {
+      if (line.includes(IMSG_SESSION)) {
+        if (line.includes("milestone=tool_execution_started")) turnToolCount++;
+        const st = statusFor(line);
+        if (st && turnBubbleGuid && st !== turnLastStatus && !manualActive()) {
+          editBubble(turnBubbleGuid, st);
+          turnLastStatus = st;
+        }
+      }
+      if (line.includes("[imessage] embedded run agent end") || line.includes("[imessage] delivered reply")) {
+        finishTurn();
+        stopTyping();
+      }
+    });
   } catch(_) {}
 }, 500);
 
-console.log("[sidecar v5] started — AppleScript-first sends, bridge optional");
+// Safety timeout: stop typing after 3min
+setInterval(() => {
+  if (typingTimer && Date.now() - turnStartedAt > 180000) stopTyping();
+}, 10000);
