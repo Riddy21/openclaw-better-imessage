@@ -5,8 +5,13 @@
 // No auto-bubbles — they just clutter. Typing starts the instant an inbound message lands.
 
 const { spawnSync } = require('child_process');
+const fs = require('fs');
 const path = require('path');
 const os = require('os');
+
+const CUR_FILE = "/tmp/hal-progress-current";
+const MANUAL_FLAG = "/tmp/hal-progress-manual";
+function manualActive() { try { return fs.existsSync(MANUAL_FLAG); } catch(_) { return false; } }
 
 const LOG_PATH = path.join(os.homedir(), 'Library/Logs/openclaw/gateway.log');
 const IMSG = '/usr/local/bin/imsg';
@@ -97,11 +102,16 @@ function finishTurn() {
   const info = { startedAt: turnStartedAt, toolCount: turnToolCount, startSnap: turnStartSnap };
   turnStartSnap = null;
   try {
-    const s = buildSummary(info);
-    if (turnBubbleGuid) editBubble(turnBubbleGuid, s);
-    else sendBubble(s);
-    console.log("[sidecar v10] turn done: " + s);
+    if (!manualActive()) {           // manual hal-progress owns the bubble → its `done` summarizes
+      const s = buildSummary(info);
+      if (turnBubbleGuid) editBubble(turnBubbleGuid, s);
+      else sendBubble(s);
+      console.log("[sidecar v11] turn done: " + s);
+    } else {
+      console.log("[sidecar v11] turn done (manual bubble owns it)");
+    }
   } catch(_) {}
+  try { if (fs.existsSync(CUR_FILE)) fs.unlinkSync(CUR_FILE); } catch(_) {}
   turnBubbleGuid = null;
   turnLastStatus = "";
 }
@@ -124,9 +134,12 @@ function startTyping() {
   turnStartedAt = Date.now();
   turnStartSnap = snapshotRepos();
   turnToolCount = 0;
+  // Clear a stale manual flag (crashed turn) so we don't stay silent forever
+  try { if (fs.existsSync(MANUAL_FLAG) && (Date.now() - fs.statSync(MANUAL_FLAG).mtimeMs > 300000)) fs.unlinkSync(MANUAL_FLAG); } catch(_) {}
   turnLastStatus = "🧠 Thinking…";
   turnBubbleGuid = sendBubbleGuid(turnLastStatus);
-  console.log("[sidecar v10] turn started, bubble=" + (turnBubbleGuid || "none"));
+  try { if (turnBubbleGuid) fs.writeFileSync(CUR_FILE, turnBubbleGuid); } catch(_) {}
+  console.log("[sidecar v11] turn started, bubble=" + (turnBubbleGuid || "none"));
 }
 function stopTyping() {
   if (typingTimer) { clearInterval(typingTimer); typingTimer = null; console.log("[sidecar v8] typing stopped"); }
@@ -144,7 +157,6 @@ setInterval(() => {
 }, 400);
 
 // Watch gateway.log for turn end → stop typing
-const fs = require('fs');
 let lastSize = 0;
 try { lastSize = fs.statSync(LOG_PATH).size; } catch(_) {}
 setInterval(() => {
@@ -160,7 +172,7 @@ setInterval(() => {
       if (line.includes(IMSG_SESSION)) {
         if (line.includes("milestone=tool_execution_started")) turnToolCount++;
         const st = statusFor(line);
-        if (st && turnBubbleGuid && st !== turnLastStatus) {
+        if (st && turnBubbleGuid && st !== turnLastStatus && !manualActive()) {
           editBubble(turnBubbleGuid, st);
           turnLastStatus = st;
         }
