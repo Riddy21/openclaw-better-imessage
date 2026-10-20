@@ -1,15 +1,17 @@
 #!/bin/zsh
-# hal-progress v10 — two-line status bubble with emoji-embodied (exec/thinking/found) + auto-capture run
+# hal-progress v12 — accumulating rich iMessage progress bubbles
+# Format: header + accumulated → step lines ending with auto ✅ Done summary
 PHONE="+12269983286"
 CHAT="iMessage;-;+12269983286"
 IMSG="/usr/local/bin/imsg"
 DB="/Users/hal9000/Library/Messages/chat.db"
 STATE_DIR="/tmp/hal-progress-state"
-CUR_FILE="/tmp/hal-progress-current"     # sidecar writes its turn bubble guid here
-MANUAL_FLAG="/tmp/hal-progress-manual"   # set while a manual rich bubble owns the turn
+CUR_FILE="/tmp/hal-progress-current"
+MANUAL_FLAG="/tmp/hal-progress-manual"
 mkdir -p "$STATE_DIR"
 
-# Sum git shortstat across tracked repos → "FILES INS DEL"
+_sql() { sqlite3 "$DB" "$1" 2>/dev/null; }
+
 _git_nums() {
   local f=0 i=0 d=0 repo out rf ri rd
   for repo in /Users/hal9000/friday-pro /Users/hal9000/.openclaw/workspace; do
@@ -23,100 +25,75 @@ _git_nums() {
   echo "$f $i $d"
 }
 
-_reply_guid() { sqlite3 "$DB" "SELECT guid FROM message WHERE is_from_me=0 ORDER BY rowid DESC LIMIT 1;" 2>/dev/null; }
+_last_user_guid() { _sql "SELECT guid FROM message WHERE is_from_me=0 ORDER BY rowid DESC LIMIT 1;"; }
 
 _send_bubble() {
-  local TEXT="$1" BEFORE RG
-  BEFORE=$(sqlite3 "$DB" "SELECT COALESCE(MAX(rowid),0) FROM message WHERE is_from_me=1;" 2>/dev/null || echo 0)
-  RG=$(_reply_guid)
-  if [[ -n $RG ]]; then
-    "$IMSG" send-rich --chat "$CHAT" --reply-to "$RG" --text "$TEXT" >/dev/null 2>&1
-    if [[ $? -eq 0 ]]; then sleep 1.2; sqlite3 "$DB" "SELECT guid FROM message WHERE is_from_me=1 AND rowid>$BEFORE ORDER BY rowid DESC LIMIT 1;" 2>/dev/null; return; fi
+  local TEXT="$1" REPLY_TO="${2:-$(_last_user_guid)}" BEFORE
+  BEFORE=$(_sql "SELECT COALESCE(MAX(rowid),0) FROM message WHERE is_from_me=1;")
+  if [[ -n $REPLY_TO ]]; then
+    "$IMSG" send-rich --chat "$CHAT" --reply-to "$REPLY_TO" --text "$TEXT" >/dev/null 2>&1
+    if [[ $? -eq 0 ]]; then
+      sleep 1.2
+      _sql "SELECT guid FROM message WHERE is_from_me=1 AND rowid>${BEFORE:-0} ORDER BY rowid DESC LIMIT 1;"
+      return
+    fi
   fi
-  osascript -e 'tell application "Messages" to send "'$TEXT'" to buddy "$PHONE" of (first service whose service type = iMessage)' >/dev/null 2>&1
+  osascript -e "tell application \"Messages\" to send \"$TEXT\" to buddy \"$PHONE\" of (first service whose service type = iMessage)" >/dev/null 2>&1
   sleep 1.2
-  sqlite3 "$DB" "SELECT guid FROM message WHERE is_from_me=1 AND rowid>$BEFORE ORDER BY rowid DESC LIMIT 1;" 2>/dev/null
+  _sql "SELECT guid FROM message WHERE is_from_me=1 AND rowid>${BEFORE:-0} ORDER BY rowid DESC LIMIT 1;"
 }
 
-_edit() {
-  local GUID="$1" HEADER="$2" STATUS="$3"
-  "$IMSG" edit --chat "$CHAT" --message "$GUID" --new-text "$(printf "%s\n\n%s" "$HEADER" "$STATUS")" --json >/dev/null 2>&1
-}
+_edit_bubble() { "$IMSG" edit --chat "$CHAT" --message "$1" --new-text "$2" --json >/dev/null 2>&1; }
 
-# Map a label to its emoji-embodied form
 _embody() {
   case "$1" in
-    exec)     echo "⚙️ exec" ;;
-    thinking) echo "🤔 thinking" ;;
-    found)    echo "🔍 found" ;;
-    done)     echo "✅ done" ;;
-    error|fail) echo "❌ error" ;;
-    *)        echo "$1" ;;
+    exec|run)      echo "⚙️ exec" ;;
+    thinking)      echo "🧠 thinking" ;;
+    found)         echo "🔍 found" ;;
+    editing|edit)  echo "📝 editing" ;;
+    error|fail)    echo "❌ error" ;;
+    done)          echo "✅ done" ;;
+    *)             echo "$1" ;;
   esac
+}
+
+_compose() {
+  local HEADER STEPS
+  HEADER=$(cat "$STATE_DIR/$1.txt" 2>/dev/null)
+  STEPS=$(cat "$STATE_DIR/$1.steps" 2>/dev/null)
+  if [[ -n $STEPS ]]; then printf "%s\n\n%s" "$HEADER" "$STEPS"
+  else printf "%s" "$HEADER"; fi
 }
 
 case $1 in
   start)
+    # start "Header text" [reply_to_guid]
     HEADER="⏳ ${2:-(working)}"
-    GUID=""
-    # Adopt the sidecar's current turn bubble if fresh (avoids a duplicate bubble)
-    if [[ -f $CUR_FILE ]]; then
-      AGE=$(( $(date +%s) - $(stat -f %m "$CUR_FILE" 2>/dev/null || echo 0) ))
-      [[ $AGE -lt 120 ]] && GUID=$(cat "$CUR_FILE" 2>/dev/null)
-    fi
-    if [[ -n $GUID ]]; then
-      _edit "$GUID" "$HEADER" ""
-    else
-      GUID=$(_send_bubble "$HEADER")
-    fi
+    REPLY_TO="${3:-$(_last_user_guid)}"
+    # Always send a fresh bubble — sidecar v12 is typing-only, nothing to adopt
+    GUID=$(_send_bubble "$HEADER" "$REPLY_TO")
     if [[ -n $GUID && ${#GUID} -lt 50 && $GUID != *"{{"* ]]; then
       printf "%s" "$HEADER" > "$STATE_DIR/$GUID.txt"
+      printf "" > "$STATE_DIR/$GUID.steps"
       date +%s > "$STATE_DIR/$GUID.start"
       _git_nums > "$STATE_DIR/$GUID.snap"
       : > "$MANUAL_FLAG"
       echo "$GUID"
     fi ;;
 
-  # update GUID label "message"  — e.g. update GUID exec "gh auth status"
   update)
     [[ -z $2 ]] && exit 0
-    HEADER=$(cat "$STATE_DIR/$2.txt" 2>/dev/null)
-    [[ -z $HEADER ]] && HEADER="⏳ Working..."
-    if [[ -n $4 || $3 == exec || $3 == thinking || $3 == found || $3 == done || $3 == error ]]; then
+    if [[ -n $4 || $3 == exec || $3 == run || $3 == thinking || $3 == found || $3 == editing || $3 == edit || $3 == done || $3 == error ]]; then
       LABEL=$(_embody "$3")
-      _edit "$2" "$HEADER" "($LABEL): $4" 
+      printf "→ (%s): %s\n" "$LABEL" "$4" >> "$STATE_DIR/$2.steps"
     else
-      # backward compat: update GUID "raw status line"
-      _edit "$2" "$HEADER" "$3"
-    fi ;;
-
-  # run GUID "command" — shows (⚙️ exec): cmd, runs it, then (🔍 found): first output line
-  run)
-    GUID="$2"; CMD="$3"
-    HEADER=$(cat "$STATE_DIR/$GUID.txt" 2>/dev/null)
-    [[ -z $HEADER ]] && HEADER="⏳ Working..."
-    _edit "$GUID" "$HEADER" "(⚙️ exec): $CMD"
-    OUT=$(eval "$CMD" 2>&1)
-    EXIT=$?
-    FIRST=$(echo "$OUT" | grep -v '^$' | head -1 | cut -c1-80)
-    if [[ $EXIT -eq 0 ]]; then
-      _edit "$GUID" "$HEADER" "(🔍 found): ${FIRST:-done ✓}"
-    else
-      _edit "$GUID" "$HEADER" "(❌ error): ${FIRST:-exit $EXIT}"
+      printf "→ %s\n" "$3" >> "$STATE_DIR/$2.steps"
     fi
-    echo "$OUT" ;;
-
-  # header GUID "new header"  — new sub-task, same bubble
-  header)
-    [[ -z $2 || -z $3 ]] && exit 0
-    NEWH="⏳ $3"
-    printf "%s" "$NEWH" > "$STATE_DIR/$2.txt"
-    _edit "$2" "$NEWH" "" ;;
+    _edit_bubble "$2" "$(_compose $2)" ;;
 
   done)
-    HEADER=$(cat "$STATE_DIR/$2.txt" 2>/dev/null)
     if [[ -n $3 ]]; then
-      _edit "$2" "${HEADER:-✅ Done}" "$3"
+      printf "→ %s\n" "$3" >> "$STATE_DIR/$2.steps"
     else
       START=$(cat "$STATE_DIR/$2.start" 2>/dev/null); START=${START:-$(date +%s)}
       SECS=$(( $(date +%s) - START )); [[ $SECS -lt 1 ]] && SECS=1
@@ -130,14 +107,38 @@ case $1 in
         [[ $DI -gt 0 ]] && S+=" +$DI"; [[ $DD -gt 0 ]] && S+=" -$DD"; S+=" · "
       fi
       S+="${SECS}s"
-      _edit "$2" "${HEADER:-⏳ Done}" "$S"
+      printf "→ %s\n" "$S" >> "$STATE_DIR/$2.steps"
     fi
-    rm -f "$STATE_DIR/${2}.txt" "$STATE_DIR/${2}.start" "$STATE_DIR/${2}.snap" "$MANUAL_FLAG" 2>/dev/null ;;
+    _edit_bubble "$2" "$(_compose $2)"
+    rm -f "$STATE_DIR/${2}.txt" "$STATE_DIR/${2}.steps" "$STATE_DIR/${2}.start" "$STATE_DIR/${2}.snap" "$MANUAL_FLAG" 2>/dev/null ;;
+
+  run)
+    # run GUID "description" command [args...]
+    GUID="$2"; DESC="$3"; shift 3
+    printf "→ (⚙️ exec): %s\n" "$DESC" >> "$STATE_DIR/$GUID.steps"
+    _edit_bubble "$GUID" "$(_compose $GUID)"
+    OUT=$(eval "$@" 2>&1); EXIT=$?
+    FIRST=$(echo "$OUT" | grep -v '^$' | head -1 | cut -c1-80)
+    if [[ $EXIT -eq 0 ]]; then
+      printf "→ (🔍 found): %s\n" "${FIRST:-✓}" >> "$STATE_DIR/$GUID.steps"
+    else
+      printf "→ (❌ error): %s\n" "${FIRST:-exit $EXIT}" >> "$STATE_DIR/$GUID.steps"
+    fi
+    _edit_bubble "$GUID" "$(_compose $GUID)"
+    echo "$OUT" ;;
+
+  header)
+    [[ -z $2 || -z $3 ]] && exit 0
+    NEWH="⏳ $3"
+    printf "%s" "$NEWH" > "$STATE_DIR/$2.txt"
+    printf "" > "$STATE_DIR/$2.steps"
+    _edit_bubble "$2" "$NEWH" ;;
 
   check-deleted)
     [[ -z $2 ]] && exit 0
-    R=$(sqlite3 "$DB" "SELECT COUNT(*) FROM message WHERE guid='$2' AND date_retracted IS NOT NULL AND date_retracted!=0;" 2>/dev/null)
-    [[ $R -gt 0 ]] && echo deleted && exit 1; echo exists ;;
+    R=$(_sql "SELECT COUNT(*) FROM message WHERE guid='$2' AND date_retracted IS NOT NULL AND date_retracted!=0;")
+    [[ ${R:-0} -gt 0 ]] && echo deleted && exit 1; echo exists ;;
 
-  *) echo "Usage: hal-progress start|update|run|header|done|check-deleted" >&2; exit 1 ;;
+  *) echo "Usage: hal-progress start|update|run|done|header|check-deleted" >&2; exit 1 ;;
 esac
+
