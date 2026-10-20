@@ -1,0 +1,13 @@
+#!/bin/zsh
+# hal-progress-exec — run a command and show it in the progress bubble
+# Usage: hal-progress-exec GUID "description" command args...
+GUID="$1"; DESC="$2"; shift 2
+hal-progress update "$GUID" "⏳ Running: $DESC"
+eval "$@"
+EXIT_CODE=$?
+if [[ $EXIT_CODE -eq 0 ]]; then
+  hal-progress update "$GUID" "✅ Done: $DESC"
+else
+  hal-progress update "$GUID" "❌ Failed: $DESC (exit $EXIT_CODE)"
+fi
+exit $EXIT_CODE
