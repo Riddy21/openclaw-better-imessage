@@ -70,14 +70,43 @@ function sendBubble(text) {
   }
   try { spawnSync(IMSG, ["send", "--to", PHONE, "--text", text, "--json"], { timeout: 6000 }); } catch(_) {}
 }
-function postSummary() {
+function sendBubbleGuid(text) {
+  const beforeRow = parseInt(sql("SELECT COALESCE(MAX(rowid),0) FROM message WHERE is_from_me=1;")) || 0;
+  const rg = getLastUserGuid();
+  if (rg) {
+    const r = spawnSync(IMSG, ["send-rich", "--chat", "iMessage;-;" + PHONE, "--reply-to", rg, "--text", text, "--json"], { timeout: 6000 });
+    if (r.status === 0) {
+      spawnSync("sleep", ["1.0"]);
+      return sql("SELECT guid FROM message WHERE is_from_me=1 AND rowid>" + beforeRow + " ORDER BY rowid DESC LIMIT 1;") || null;
+    }
+  }
+  return null;
+}
+function editBubble(guid, text) {
+  try { spawnSync(IMSG, ["edit", "--chat", "iMessage;-;" + PHONE, "--message", guid, "--new-text", text, "--json"], { timeout: 5000 }); } catch(_) {}
+}
+// Embodied status per activity. The gateway log only distinguishes model-call
+// (thinking) from tool-exec (running a command), so those are the two we embody.
+function statusFor(line) {
+  if (line.includes("milestone=model_call_started")) return "🧠 Thinking…";
+  if (line.includes("milestone=tool_execution_started")) return "🔧 Running a command…";
+  return null;
+}
+function finishTurn() {
   if (turnStartSnap === null) return;
   const info = { startedAt: turnStartedAt, toolCount: turnToolCount, startSnap: turnStartSnap };
   turnStartSnap = null;
-  try { const s = buildSummary(info); sendBubble(s); console.log("[sidecar v9] summary: " + s); } catch(_) {}
+  try {
+    const s = buildSummary(info);
+    if (turnBubbleGuid) editBubble(turnBubbleGuid, s);
+    else sendBubble(s);
+    console.log("[sidecar v10] turn done: " + s);
+  } catch(_) {}
+  turnBubbleGuid = null;
+  turnLastStatus = "";
 }
 
-console.log("[sidecar v9] started — typing + end-of-turn summary");
+console.log("[sidecar v10] started — embodied status + end-of-turn summary");
 
 // Instant typing: poll chat.db for new inbound, keep typing alive while turn runs
 let lastSeenRow = parseInt(sql("SELECT COALESCE(MAX(rowid),0) FROM message;")) || 0;
@@ -85,6 +114,8 @@ let typingTimer = null;
 let turnStartedAt = 0;
 let turnStartSnap = null;
 let turnToolCount = 0;
+let turnBubbleGuid = null;
+let turnLastStatus = "";
 
 function startTyping() {
   if (typingTimer) return;
@@ -93,7 +124,9 @@ function startTyping() {
   turnStartedAt = Date.now();
   turnStartSnap = snapshotRepos();
   turnToolCount = 0;
-  console.log("[sidecar v9] typing started");
+  turnLastStatus = "🧠 Thinking…";
+  turnBubbleGuid = sendBubbleGuid(turnLastStatus);
+  console.log("[sidecar v10] turn started, bubble=" + (turnBubbleGuid || "none"));
 }
 function stopTyping() {
   if (typingTimer) { clearInterval(typingTimer); typingTimer = null; console.log("[sidecar v8] typing stopped"); }
@@ -124,11 +157,16 @@ setInterval(() => {
     fs.closeSync(fd);
     lastSize = stat.size;
     buf.toString("utf8").split("\n").filter(Boolean).forEach(line => {
-      if (line.includes(IMSG_SESSION) && line.includes("milestone=tool_execution_started")) {
-        turnToolCount++;
+      if (line.includes(IMSG_SESSION)) {
+        if (line.includes("milestone=tool_execution_started")) turnToolCount++;
+        const st = statusFor(line);
+        if (st && turnBubbleGuid && st !== turnLastStatus) {
+          editBubble(turnBubbleGuid, st);
+          turnLastStatus = st;
+        }
       }
       if (line.includes("[imessage] embedded run agent end") || line.includes("[imessage] delivered reply")) {
-        postSummary();
+        finishTurn();
         stopTyping();
       }
     });
