@@ -167,13 +167,17 @@ launchctl load ~/Library/LaunchAgents/ai.openclaw.messages-watchdog.plist
 launchctl load ~/Library/LaunchAgents/ai.openclaw.hal-progress.plist
 ```
 
-### 4. Enable the OpenClaw hook
+### 4. OpenClaw hook (⚠️ disabled by default)
+
+> **The `imessage-progress` hook is disabled by default.** When enabled, it fires on every inbound iMessage and auto-creates an "⏳ On it…" bubble. If the agent errors before replying (e.g. due to context bloat), you end up with a pile of unresolved bubbles and no actual responses. Keep it disabled and let the agent drive bubbles manually via `hal-progress start`.
+
+If you want to experiment with it anyway:
 
 ```bash
 mkdir -p ~/.openclaw/hooks/imessage-progress
 cp scripts/imessage/hooks/imessage-progress/HOOK.md ~/.openclaw/hooks/imessage-progress/
 cp scripts/imessage/hooks/imessage-progress/handler.js ~/.openclaw/hooks/imessage-progress/
-openclaw hooks enable imessage-progress
+openclaw hooks enable imessage-progress   # not recommended — see warning above
 ```
 
 ### 5. Set compaction mode
